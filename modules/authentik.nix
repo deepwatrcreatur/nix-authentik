@@ -7,6 +7,11 @@
 
 let
   cfg = config.services.authentik;
+  generatedSecretsDir = "${cfg.stateDir}/secrets";
+  effectiveSecretKeyFile =
+    if cfg.secretKeyFile != null then cfg.secretKeyFile else "${generatedSecretsDir}/secret-key";
+  effectiveBootstrapPasswordFile =
+    if cfg.bootstrap.passwordFile != null then cfg.bootstrap.passwordFile else "${generatedSecretsDir}/bootstrap-password";
 
   boolString = value: if value then "true" else "false";
 
@@ -40,25 +45,25 @@ let
     }
     // cfg.settings;
 
-  mkServiceScript =
-    role:
-    pkgs.writeShellScript "authentik-${role}" ''
+  mkAkScript =
+    command:
+    pkgs.writeShellScript "authentik-${lib.replaceStrings [ " " ] [ "-" ] command}" ''
       set -eu
       export TMPDIR=/dev/shm
       export PYTHONDONTWRITEBYTECODE=1
       export PYTHONUNBUFFERED=1
       ${renderExports baseEnvironment}
-      export AUTHENTIK_SECRET_KEY="$(<${cfg.secretKeyFile})"
+      export AUTHENTIK_SECRET_KEY="$(<${effectiveSecretKeyFile})"
       ${lib.optionalString (cfg.database.passwordFile != null) ''
         export AUTHENTIK_POSTGRESQL__PASSWORD="$(<${cfg.database.passwordFile})"
       ''}
-      ${lib.optionalString (cfg.bootstrapPasswordFile != null) ''
-        export AUTHENTIK_BOOTSTRAP_PASSWORD="$(<${cfg.bootstrapPasswordFile})"
+      ${lib.optionalString cfg.bootstrap.enable ''
+        export AUTHENTIK_BOOTSTRAP_PASSWORD="$(<${effectiveBootstrapPasswordFile})"
       ''}
       ${lib.optionalString (cfg.bootstrapEmail != null) ''
         export AUTHENTIK_BOOTSTRAP_EMAIL=${lib.escapeShellArg cfg.bootstrapEmail}
       ''}
-      exec ${cfg.package}/bin/ak ${role}
+      exec ${cfg.package}/bin/ak ${command}
     '';
 
   localRedisPortDefault = 6379;
@@ -101,14 +106,14 @@ in
     };
 
     secretKeyFile = lib.mkOption {
-      type = lib.types.path;
-      description = "Path to a file containing the Authentik secret key.";
-    };
-
-    bootstrapPasswordFile = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
       default = null;
-      description = "Optional file containing the initial bootstrap admin password.";
+      description = ''
+        Path to a file containing the Authentik secret key.
+
+        Leave this as `null` to let the module generate and persist a local
+        secret in `${generatedSecretsDir}` on first boot.
+      '';
     };
 
     bootstrapEmail = lib.mkOption {
@@ -116,6 +121,25 @@ in
       default = null;
       example = "admin@example.com";
       description = "Optional bootstrap admin email address.";
+    };
+
+    bootstrap = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Whether to provide bootstrap admin credentials on first startup.";
+      };
+
+      passwordFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        description = ''
+          Optional file containing the bootstrap admin password.
+
+          Leave this as `null` to let the module generate and persist a local
+          bootstrap password in `${generatedSecretsDir}` on first boot.
+        '';
+      };
     };
 
     settings = lib.mkOption {
@@ -209,6 +233,10 @@ in
         assertion = cfg.redis.createLocally || cfg.redis.host != "";
         message = "services.authentik.redis.host must be set when Redis is external.";
       }
+      {
+        assertion = cfg.bootstrap.enable || cfg.bootstrap.passwordFile == null;
+        message = "services.authentik.bootstrap.passwordFile is only valid when bootstrap is enabled.";
+      }
     ];
 
     users.users.${cfg.user} = {
@@ -242,25 +270,102 @@ in
     systemd.tmpfiles.rules = [
       "d ${cfg.stateDir} 0750 ${cfg.user} ${cfg.group} -"
       "d ${cfg.mediaDir} 0750 ${cfg.user} ${cfg.group} -"
+      "d ${generatedSecretsDir} 0750 ${cfg.user} ${cfg.group} -"
     ];
 
-    systemd.services.authentik-server = {
-      description = "Auth­entik server";
+    systemd.services.authentik-prepare-secrets = {
+      description = "Prepare persistent Authentik secrets";
+      before = [
+        "authentik-server.service"
+      ] ++ lib.optionals cfg.worker.enable [
+        "authentik-worker.service"
+      ];
       wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        User = cfg.user;
+        Group = cfg.group;
+        ExecStart = pkgs.writeShellScript "authentik-prepare-secrets" ''
+          set -eu
+
+          install -d -m 0750 ${lib.escapeShellArg generatedSecretsDir}
+
+          if [ ! -s ${lib.escapeShellArg effectiveSecretKeyFile} ]; then
+            umask 0077
+            ${pkgs.openssl}/bin/openssl rand -hex 64 > ${lib.escapeShellArg effectiveSecretKeyFile}
+          fi
+
+          ${lib.optionalString cfg.bootstrap.enable ''
+            if [ ! -s ${lib.escapeShellArg effectiveBootstrapPasswordFile} ]; then
+              umask 0077
+              ${pkgs.openssl}/bin/openssl rand -base64 24 > ${lib.escapeShellArg effectiveBootstrapPasswordFile}
+            fi
+          ''}
+        '';
+        ReadWritePaths = [
+          cfg.stateDir
+          generatedSecretsDir
+        ];
+      };
+    };
+
+    systemd.services.authentik-migrate = {
+      description = "Auth­entik database migrations";
+      before = [
+        "authentik-server.service"
+      ] ++ lib.optionals cfg.worker.enable [
+        "authentik-worker.service"
+      ];
       after =
         [
           "network.target"
+          "authentik-prepare-secrets.service"
         ]
         ++ lib.optionals cfg.database.createLocally [ "postgresql.service" ]
         ++ lib.optionals cfg.redis.createLocally [ "redis-authentik.service" ];
       wants =
+        [ "authentik-prepare-secrets.service" ]
+        ++
         lib.optionals cfg.database.createLocally [ "postgresql.service" ]
         ++ lib.optionals cfg.redis.createLocally [ "redis-authentik.service" ];
       serviceConfig = {
         User = cfg.user;
         Group = cfg.group;
         WorkingDirectory = cfg.stateDir;
-        ExecStart = mkServiceScript "server";
+        Type = "oneshot";
+        ExecStart = mkAkScript "migrate";
+        Restart = "no";
+        RemainAfterExit = true;
+        NoNewPrivileges = true;
+        PrivateTmp = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        ReadWritePaths = [
+          cfg.stateDir
+          cfg.mediaDir
+        ];
+      };
+    };
+
+    systemd.services.authentik-server = {
+      description = "Auth­entik server";
+      wantedBy = [ "multi-user.target" ];
+      after = [
+        "network.target"
+        "authentik-prepare-secrets.service"
+        "authentik-migrate.service"
+      ] ++ lib.optionals cfg.database.createLocally [ "postgresql.service" ]
+        ++ lib.optionals cfg.redis.createLocally [ "redis-authentik.service" ];
+      wants = [
+        "authentik-prepare-secrets.service"
+        "authentik-migrate.service"
+      ] ++ lib.optionals cfg.database.createLocally [ "postgresql.service" ]
+        ++ lib.optionals cfg.redis.createLocally [ "redis-authentik.service" ];
+      serviceConfig = {
+        User = cfg.user;
+        Group = cfg.group;
+        WorkingDirectory = cfg.stateDir;
+        ExecStart = mkAkScript "server";
         Restart = "on-failure";
         RestartSec = 5;
         NoNewPrivileges = true;
@@ -277,13 +382,21 @@ in
     systemd.services.authentik-worker = lib.mkIf cfg.worker.enable {
       description = "Auth­entik worker";
       wantedBy = [ "multi-user.target" ];
-      after = [ "authentik-server.service" ];
-      wants = [ "authentik-server.service" ];
+      after = [
+        "authentik-prepare-secrets.service"
+        "authentik-migrate.service"
+        "authentik-server.service"
+      ];
+      wants = [
+        "authentik-prepare-secrets.service"
+        "authentik-migrate.service"
+        "authentik-server.service"
+      ];
       serviceConfig = {
         User = cfg.user;
         Group = cfg.group;
         WorkingDirectory = cfg.stateDir;
-        ExecStart = mkServiceScript "worker";
+        ExecStart = mkAkScript "worker";
         Restart = "on-failure";
         RestartSec = 5;
         NoNewPrivileges = true;
