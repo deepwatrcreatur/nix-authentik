@@ -426,6 +426,7 @@ in
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
         Type = "oneshot";
+        RemainAfterExit = true;
         User = "root";
         Group = "root";
         ExecStart = pkgs.writeShellScript "authentik-prepare-blueprints" ''
