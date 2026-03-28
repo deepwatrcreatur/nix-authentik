@@ -31,9 +31,13 @@ This first version is intentionally narrow:
 
 It does not yet try to make Authentik applications, providers, or outposts declarative.
 
-It now supports managed blueprints, so applications and providers can be
-declared through Authentik's native blueprint system without hand-driving the
-admin UI.
+It now supports:
+- managed blueprints
+- runtime-rendered blueprints
+- declarative OIDC application/provider pairs
+
+That means applications and providers can be declared through Authentik's
+native blueprint system without hand-driving the admin UI.
 
 ## Quick Start
 
@@ -61,12 +65,16 @@ Then import the module:
     domain = "auth.example.com";
     secretKeyFile = /run/secrets/authentik-secret-key;
     bootstrap.passwordFile = /run/secrets/authentik-bootstrap-password;
-    blueprints.files."example-app.yaml" = ''
-      version: 1
-      metadata:
-        name: Example app
-      entries: []
-    '';
+    applications.oidc.paperless = {
+      slug = "paperless-ngx";
+      displayName = "Paperless NGX";
+      launchUrl = "https://paperless.example.com/";
+      clientId = "paperless-ngx";
+      clientSecretFile = /run/secrets/paperless-oidc-client-secret;
+      redirectUris = [
+        "https://paperless.example.com/accounts/oidc/authentik/login/callback/"
+      ];
+    };
   };
 }
 ```
@@ -118,10 +126,35 @@ When enabled, the module provisions a local Redis instance and configures Authen
 Additional Authentik blueprint YAML files to merge into the managed blueprint
 directory.
 
+### `services.authentik.applications.oidc`
+Declarative OIDC application/provider pairs rendered into runtime blueprints.
+
+Use this for the common case where you want Authentik to expose an OAuth/OIDC
+application with a confidential client secret stored on disk:
+
+```nix
+services.authentik.applications.oidc.paperless = {
+  slug = "paperless-ngx";
+  displayName = "Paperless NGX";
+  launchUrl = "https://paperless.example.com/";
+  clientId = "paperless-ngx";
+  clientSecretFile = /run/secrets/paperless-oidc-client-secret;
+  redirectUris = [
+    "https://paperless.example.com/accounts/oidc/authentik/login/callback/"
+  ];
+};
+```
+
 ### `services.authentik.blueprints.extraDirs`
 Additional directories whose `.yaml` files should be merged into the managed
 blueprint directory before Authentik starts. This is useful when a blueprint
 needs to be rendered at runtime from secrets.
+
+### `services.authentik.blueprints.rendered`
+Low-level escape hatch for custom runtime-rendered blueprints.
+
+This is still available for unusual integrations, but standard OAuth/OIDC apps
+should prefer `services.authentik.applications.oidc`.
 
 ## First-Boot Secrets
 
@@ -159,6 +192,19 @@ That managed directory contains:
 
 This keeps the native Authentik defaults intact while allowing additional
 declarative application/provider blueprints.
+
+## Declarative OIDC Applications
+
+`services.authentik.applications.oidc` builds on the runtime blueprint system
+and generates the Authentik provider/application YAML for you.
+
+Each OIDC application entry:
+- reads its client secret from a runtime file
+- renders a managed blueprint under `/var/lib/authentik/blueprints-rendered`
+- merges that rendered blueprint into Authentik's managed blueprint directory
+
+This keeps the application structure in the flake instead of pushing raw
+Auth­entik blueprint YAML into each consuming repo.
 
 ## Development Direction
 

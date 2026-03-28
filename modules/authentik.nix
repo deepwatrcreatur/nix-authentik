@@ -10,6 +10,12 @@ let
   generatedSecretsDir = "${cfg.stateDir}/secrets";
   managedBlueprintsDir = "${cfg.stateDir}/blueprints";
   renderedBlueprintsDir = "${cfg.stateDir}/blueprints-rendered";
+  defaultOauthScopeMappings = [
+    "goauthentik.io/providers/oauth2/scope-openid"
+    "goauthentik.io/providers/oauth2/scope-email"
+    "goauthentik.io/providers/oauth2/scope-profile"
+    "goauthentik.io/providers/oauth2/scope-offline_access"
+  ];
   usesManagedSecretKey = cfg.secretKeyFile == null;
   usesManagedBootstrapPassword = cfg.bootstrap.enable && cfg.bootstrap.passwordFile == null;
   needsNetworkOnline = !(cfg.database.createLocally && cfg.redis.createLocally);
@@ -64,6 +70,82 @@ let
     lib.concatStringsSep "\n" (
       lib.mapAttrsToList (name: value: "export ${name}=${lib.escapeShellArg (renderValue value)}") attrs
     );
+
+  mkRenderedOidcApplicationScript =
+    name:
+    oidcCfg:
+    let
+      oidcSpec = builtins.toJSON {
+        slug = oidcCfg.slug;
+        displayName = oidcCfg.displayName;
+        launchUrl = oidcCfg.launchUrl;
+        clientId = oidcCfg.clientId;
+        clientSecretFile = toString oidcCfg.clientSecretFile;
+        redirectUris = oidcCfg.redirectUris;
+        authorizationFlowSlug = oidcCfg.authorizationFlowSlug;
+        invalidationFlowSlug = oidcCfg.invalidationFlowSlug;
+        propertyMappings = oidcCfg.propertyMappings;
+        signingKeyName = oidcCfg.signingKeyName;
+      };
+    in
+    ''
+      export AUTHENTIK_OIDC_BLUEPRINT_SPEC=${lib.escapeShellArg oidcSpec}
+      ${pkgs.python3}/bin/python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+spec = json.loads(os.environ["AUTHENTIK_OIDC_BLUEPRINT_SPEC"])
+target = Path(os.environ["AUTHENTIK_BLUEPRINT_OUTPUT"])
+client_secret = Path(spec["clientSecretFile"]).read_text().strip()
+
+if not client_secret:
+    raise SystemExit(f"OIDC client secret file is empty: {spec['clientSecretFile']}")
+
+property_mappings = "\n".join(
+    f"        - !Find [authentik_providers_oauth2.scopemapping, [managed, {mapping}]]"
+    for mapping in spec["propertyMappings"]
+)
+redirect_uris = "\n".join(
+    f"        - matching_mode: strict\n          url: {uri}"
+    for uri in spec["redirectUris"]
+)
+launch_url = spec["launchUrl"] or ""
+meta_launch_url = (
+    f"      meta_launch_url: {launch_url}\n"
+    if launch_url
+    else ""
+)
+
+target.write_text(
+    "version: 1\n"
+    f"metadata:\n  name: {spec['displayName']}\n"
+    "entries:\n"
+    "  - model: authentik_providers_oauth2.oauth2provider\n"
+    f"    id: {spec['slug']}_provider\n"
+    "    identifiers:\n"
+    f"      name: {spec['slug']}\n"
+    "    attrs:\n"
+    f"      authorization_flow: !Find [authentik_flows.flow, [slug, {spec['authorizationFlowSlug']}]]\n"
+    f"      invalidation_flow: !Find [authentik_flows.flow, [slug, {spec['invalidationFlowSlug']}]]\n"
+    "      client_type: confidential\n"
+    f"      client_id: {spec['clientId']}\n"
+    f"      client_secret: {client_secret}\n"
+    "      redirect_uris:\n"
+    f"{redirect_uris}\n"
+    "      property_mappings:\n"
+    f"{property_mappings}\n"
+    f"      signing_key: !Find [authentik_crypto.certificatekeypair, [name, {spec['signingKeyName']}]]\n"
+    "  - model: authentik_core.application\n"
+    "    identifiers:\n"
+    f"      slug: {spec['slug']}\n"
+    "    attrs:\n"
+    f"      provider: !KeyOf {spec['slug']}_provider\n"
+    f"      name: {spec['displayName']}\n"
+    f"{meta_launch_url}"
+)
+PY
+    '';
 
   baseEnvironment =
     {
@@ -259,6 +341,97 @@ in
       };
     };
 
+    applications.oidc = lib.mkOption {
+      type = lib.types.attrsOf (
+        lib.types.submodule (
+          { name, ... }:
+          {
+            options = {
+              slug = lib.mkOption {
+                type = lib.types.str;
+                default = name;
+                description = "Authentik application and provider slug.";
+              };
+
+              displayName = lib.mkOption {
+                type = lib.types.str;
+                default = name;
+                description = "Human-readable Authentik application name.";
+              };
+
+              launchUrl = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                description = "Optional application launch URL shown in the Authentik UI.";
+              };
+
+              clientId = lib.mkOption {
+                type = lib.types.str;
+                description = "OIDC client ID exposed by the application.";
+              };
+
+              clientSecretFile = lib.mkOption {
+                type = lib.types.path;
+                description = "Path to a file containing the OIDC client secret.";
+              };
+
+              redirectUris = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                description = "Allowed OIDC redirect URIs for this application.";
+              };
+
+              authorizationFlowSlug = lib.mkOption {
+                type = lib.types.str;
+                default = "default-provider-authorization-implicit-consent";
+                description = "Authentik authorization flow slug to attach to this provider.";
+              };
+
+              invalidationFlowSlug = lib.mkOption {
+                type = lib.types.str;
+                default = "default-provider-invalidation-flow";
+                description = "Authentik invalidation flow slug to attach to this provider.";
+              };
+
+              propertyMappings = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = defaultOauthScopeMappings;
+                description = "Managed OAuth2 scope mappings to attach to this provider.";
+              };
+
+              signingKeyName = lib.mkOption {
+                type = lib.types.str;
+                default = "authentik Self-signed Certificate";
+                description = "Authentik certificate keypair name used to sign tokens.";
+              };
+
+              fileName = lib.mkOption {
+                type = lib.types.str;
+                default = "${name}.yaml";
+                description = "Filename to generate for this OIDC application blueprint.";
+              };
+            };
+          }
+        )
+      );
+      default = { };
+      example = {
+        paperless = {
+          slug = "paperless-ngx";
+          displayName = "Paperless NGX";
+          launchUrl = "https://paperless.example.com/";
+          clientId = "paperless-ngx";
+          clientSecretFile = /run/secrets/paperless-oidc-client-secret;
+          redirectUris = [
+            "https://paperless.example.com/accounts/oidc/authentik/login/callback/"
+          ];
+        };
+      };
+      description = ''
+        Declarative OIDC applications/providers to render into Authentik
+        blueprints at runtime.
+      '';
+    };
+
     blueprints = {
       files = lib.mkOption {
         type = lib.types.attrsOf (
@@ -334,6 +507,10 @@ in
         description = ''
           Runtime-rendered blueprint files that should be generated before
           Authentik prepares its managed blueprint directory.
+
+          Prefer `services.authentik.applications.oidc` for standard OAuth/OIDC
+          application/provider pairs and use this lower-level escape hatch for
+          custom blueprint generation.
         '';
       };
     };
@@ -341,7 +518,7 @@ in
 
   config =
     let
-      hasRenderedBlueprints = cfg.blueprints.rendered != { };
+      hasRenderedBlueprints = cfg.blueprints.rendered != { } || cfg.applications.oidc != { };
       effectiveBlueprintExtraDirs =
         lib.optionals hasRenderedBlueprints [ renderedBlueprintsDir ] ++ cfg.blueprints.extraDirs;
       renderBlueprintsScript = pkgs.writeShellScript "authentik-render-blueprints" ''
@@ -362,6 +539,19 @@ in
             )
           ''
         ) (builtins.attrNames cfg.blueprints.rendered)}
+
+        ${lib.concatMapStringsSep "\n" (
+          name:
+          let
+            oidcCfg = cfg.applications.oidc.${name};
+          in
+          ''
+            (
+              export AUTHENTIK_BLUEPRINT_OUTPUT=${lib.escapeShellArg "${renderedBlueprintsDir}/${oidcCfg.fileName}"}
+              ${mkRenderedOidcApplicationScript name oidcCfg}
+            )
+          ''
+        ) (builtins.attrNames cfg.applications.oidc)}
       '';
     in
     lib.mkIf cfg.enable {
