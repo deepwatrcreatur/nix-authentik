@@ -12,17 +12,15 @@ let
   usesManagedSecretKey = cfg.secretKeyFile == null;
   usesManagedBootstrapPassword = cfg.bootstrap.enable && cfg.bootstrap.passwordFile == null;
   needsNetworkOnline = !(cfg.database.createLocally && cfg.redis.createLocally);
-  managedBlueprintFiles = lib.mapAttrsToList (
-    name: value:
-    pkgs.writeText name (
-      if builtins.isPath value then builtins.readFile value else value
-    )
-  ) cfg.blueprints.files;
   storedBlueprintsDir = pkgs.linkFarm "authentik-extra-blueprints" (
-    map (file: {
-      name = builtins.baseNameOf file;
-      path = file;
-    }) managedBlueprintFiles
+    lib.mapAttrsToList (
+      name: value: {
+        inherit name;
+        path = pkgs.writeText name (
+          if builtins.isPath value then builtins.readFile value else value
+        );
+      }
+    ) cfg.blueprints.files
   );
   effectiveSecretKeyFile =
     if cfg.secretKeyFile != null then cfg.secretKeyFile else "${generatedSecretsDir}/secret-key";
@@ -43,21 +41,31 @@ let
   } ''
     set -eu
 
-    env_path="$(${pkgs.gnused}/bin/sed -n 's@.*\(/nix/store/[^[:space:]]*-python[^[:space:]]*-env\)/bin.*@\1@p' ${cfg.package}/bin/ak | head -n 1)"
-    if [ -z "$env_path" ]; then
-      echo "Failed to determine Authentik Python environment from ${cfg.package}/bin/ak" >&2
+    env_paths="$(${pkgs.gnugrep}/bin/grep -oE '/nix/store/[^[:space:]]*-python[^[:space:]]*-env' ${cfg.package}/bin/ak | ${pkgs.coreutils}/bin/sort -u || true)"
+    if [ "$(${pkgs.coreutils}/bin/printf '%s\n' "$env_paths" | ${pkgs.gnugrep}/bin/grep -c . || true)" -ne 1 ]; then
+      echo "Expected exactly one Authentik Python environment in ${cfg.package}/bin/ak, got:" >&2
+      ${pkgs.coreutils}/bin/printf '%s\n' "$env_paths" >&2
       exit 1
     fi
+    env_path="$(${pkgs.coreutils}/bin/printf '%s\n' "$env_paths")"
 
-    default_yml="$(${pkgs.findutils}/bin/find "$env_path/lib" -path '*/authentik/lib/default.yml' | head -n 1)"
-    if [ -z "$default_yml" ]; then
-      echo "Failed to locate authentik/lib/default.yml under $env_path" >&2
+    default_yml_matches="$(${pkgs.findutils}/bin/find "$env_path/lib" -path '*/authentik/lib/default.yml' -print || true)"
+    if [ "$(${pkgs.coreutils}/bin/printf '%s\n' "$default_yml_matches" | ${pkgs.gnugrep}/bin/grep -c . || true)" -ne 1 ]; then
+      echo "Expected exactly one authentik/lib/default.yml under $env_path, got:" >&2
+      ${pkgs.coreutils}/bin/printf '%s\n' "$default_yml_matches" >&2
       exit 1
     fi
+    default_yml="$(${pkgs.coreutils}/bin/printf '%s\n' "$default_yml_matches")"
 
-    blueprint_dir="$(${pkgs.gnused}/bin/sed -n 's@^blueprints_dir: @@p' "$default_yml" | head -n 1)"
-    if [ -z "$blueprint_dir" ]; then
-      echo "Failed to determine packaged blueprints_dir from $default_yml" >&2
+    blueprint_dir_matches="$(${pkgs.gnused}/bin/sed -n 's@^blueprints_dir: @@p' "$default_yml" | ${pkgs.coreutils}/bin/sort -u || true)"
+    if [ "$(${pkgs.coreutils}/bin/printf '%s\n' "$blueprint_dir_matches" | ${pkgs.gnugrep}/bin/grep -c . || true)" -ne 1 ]; then
+      echo "Expected exactly one packaged blueprints_dir in $default_yml, got:" >&2
+      ${pkgs.coreutils}/bin/printf '%s\n' "$blueprint_dir_matches" >&2
+      exit 1
+    fi
+    blueprint_dir="$(${pkgs.coreutils}/bin/printf '%s\n' "$blueprint_dir_matches")"
+    if [ ! -d "$blueprint_dir" ]; then
+      echo "Packaged blueprints_dir does not exist: $blueprint_dir" >&2
       exit 1
     fi
 
@@ -423,13 +431,23 @@ in
         ExecStart = pkgs.writeShellScript "authentik-prepare-blueprints" ''
           set -eu
 
+          if [ -L ${lib.escapeShellArg managedBlueprintsDir} ]; then
+            echo "Refusing to operate on symlinked blueprint directory: ${managedBlueprintsDir}" >&2
+            exit 1
+          fi
+
+          if [ -e ${lib.escapeShellArg managedBlueprintsDir} ] && [ ! -d ${lib.escapeShellArg managedBlueprintsDir} ]; then
+            echo "Blueprint path exists but is not a directory: ${managedBlueprintsDir}" >&2
+            exit 1
+          fi
+
           install -d -m 0755 ${lib.escapeShellArg managedBlueprintsDir}
-          rm -rf ${lib.escapeShellArg managedBlueprintsDir}/*
+          ${pkgs.findutils}/bin/find ${lib.escapeShellArg managedBlueprintsDir} -mindepth 1 -delete
 
           packaged_blueprints_dir="$(cat ${packagedBlueprintsDir})"
           cp -a --no-preserve=ownership "$packaged_blueprints_dir"/. ${lib.escapeShellArg managedBlueprintsDir}/
 
-          ${lib.optionalString (managedBlueprintFiles != [ ]) ''
+          ${lib.optionalString (cfg.blueprints.files != { }) ''
             cp -a --no-preserve=ownership ${storedBlueprintsDir}/. ${lib.escapeShellArg managedBlueprintsDir}/
           ''}
 
@@ -437,9 +455,13 @@ in
             dir: ''
               if [ -d ${lib.escapeShellArg dir} ]; then
                 cp -a --no-preserve=ownership ${lib.escapeShellArg dir}/. ${lib.escapeShellArg managedBlueprintsDir}/
+              else
+                echo "Warning: configured blueprint directory is missing: ${dir}" >&2
               fi
             ''
           ) cfg.blueprints.extraDirs}
+
+          chown -R ${lib.escapeShellArg cfg.user}:${lib.escapeShellArg cfg.group} ${lib.escapeShellArg managedBlueprintsDir}
         '';
         ReadWritePaths = [ managedBlueprintsDir ];
       };
