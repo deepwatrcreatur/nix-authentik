@@ -49,23 +49,9 @@ let
     fi
     env_path="$(${pkgs.coreutils}/bin/printf '%s\n' "$env_paths")"
 
-    default_yml_matches="$(${pkgs.findutils}/bin/find "$env_path/lib" -path '*/authentik/lib/default.yml' -print || true)"
-    if [ "$(${pkgs.coreutils}/bin/printf '%s\n' "$default_yml_matches" | ${pkgs.gnugrep}/bin/grep -c . || true)" -ne 1 ]; then
-      echo "Expected exactly one authentik/lib/default.yml under $env_path, got:" >&2
-      ${pkgs.coreutils}/bin/printf '%s\n' "$default_yml_matches" >&2
-      exit 1
-    fi
-    default_yml="$(${pkgs.coreutils}/bin/printf '%s\n' "$default_yml_matches")"
-
-    blueprint_dir_matches="$(${pkgs.gnused}/bin/sed -n 's@^blueprints_dir: @@p' "$default_yml" | ${pkgs.coreutils}/bin/sort -u || true)"
-    if [ "$(${pkgs.coreutils}/bin/printf '%s\n' "$blueprint_dir_matches" | ${pkgs.gnugrep}/bin/grep -c . || true)" -ne 1 ]; then
-      echo "Expected exactly one packaged blueprints_dir in $default_yml, got:" >&2
-      ${pkgs.coreutils}/bin/printf '%s\n' "$blueprint_dir_matches" >&2
-      exit 1
-    fi
-    blueprint_dir="$(${pkgs.coreutils}/bin/printf '%s\n' "$blueprint_dir_matches")"
+    blueprint_dir="$env_path/blueprints"
     if [ ! -d "$blueprint_dir" ]; then
-      echo "Packaged blueprints_dir does not exist: $blueprint_dir" >&2
+      echo "Packaged blueprints directory does not exist under Authentik Python environment: $blueprint_dir" >&2
       exit 1
     fi
 
