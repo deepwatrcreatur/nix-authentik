@@ -80,6 +80,7 @@ let
         displayName = oidcCfg.displayName;
         launchUrl = oidcCfg.launchUrl;
         clientId = oidcCfg.clientId;
+        clientIdFile = if oidcCfg.clientIdFile == null then null else toString oidcCfg.clientIdFile;
         clientSecretFile = toString oidcCfg.clientSecretFile;
         redirectUris = oidcCfg.redirectUris;
         authorizationFlowSlug = oidcCfg.authorizationFlowSlug;
@@ -97,7 +98,15 @@ from pathlib import Path
 
 spec = json.loads(os.environ["AUTHENTIK_OIDC_BLUEPRINT_SPEC"])
 target = Path(os.environ["AUTHENTIK_BLUEPRINT_OUTPUT"])
+client_id = spec.get("clientId")
+client_id_file = spec.get("clientIdFile")
 client_secret = Path(spec["clientSecretFile"]).read_text().strip()
+
+if client_id_file:
+    client_id = Path(client_id_file).read_text().strip()
+
+if not client_id:
+    raise SystemExit("OIDC client ID is empty")
 
 if not client_secret:
     raise SystemExit(f"OIDC client secret file is empty: {spec['clientSecretFile']}")
@@ -129,7 +138,7 @@ target.write_text(
     f"      authorization_flow: !Find [authentik_flows.flow, [slug, {spec['authorizationFlowSlug']}]]\n"
     f"      invalidation_flow: !Find [authentik_flows.flow, [slug, {spec['invalidationFlowSlug']}]]\n"
     "      client_type: confidential\n"
-    f"      client_id: {spec['clientId']}\n"
+    f"      client_id: {client_id}\n"
     f"      client_secret: {client_secret}\n"
     "      redirect_uris:\n"
     f"{redirect_uris}\n"
@@ -366,8 +375,15 @@ in
               };
 
               clientId = lib.mkOption {
-                type = lib.types.str;
-                description = "OIDC client ID exposed by the application.";
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                description = "Static OIDC client ID exposed by the application.";
+              };
+
+              clientIdFile = lib.mkOption {
+                type = lib.types.nullOr lib.types.path;
+                default = null;
+                description = "Optional file containing the OIDC client ID at runtime.";
               };
 
               clientSecretFile = lib.mkOption {
@@ -567,6 +583,16 @@ in
       {
         assertion = cfg.bootstrap.enable || cfg.bootstrap.passwordFile == null;
         message = "services.authentik.bootstrap.passwordFile is only valid when bootstrap is enabled.";
+      }
+      {
+        assertion =
+          lib.all (
+            oidcCfg: (oidcCfg.clientId != null) != (oidcCfg.clientIdFile != null)
+          ) (builtins.attrValues cfg.applications.oidc);
+        message = ''
+          Each services.authentik.applications.oidc entry must set exactly one of
+          clientId or clientIdFile.
+        '';
       }
     ];
 

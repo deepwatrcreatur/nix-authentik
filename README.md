@@ -69,7 +69,7 @@ Then import the module:
       slug = "paperless-ngx";
       displayName = "Paperless NGX";
       launchUrl = "https://paperless.example.com/";
-      clientId = "paperless-ngx";
+      clientIdFile = /run/secrets/paperless-oidc-client-id;
       clientSecretFile = /run/secrets/paperless-oidc-client-secret;
       redirectUris = [
         "https://paperless.example.com/accounts/oidc/authentik/login/callback/"
@@ -137,13 +137,17 @@ services.authentik.applications.oidc.paperless = {
   slug = "paperless-ngx";
   displayName = "Paperless NGX";
   launchUrl = "https://paperless.example.com/";
-  clientId = "paperless-ngx";
+  clientIdFile = /run/secrets/paperless-oidc-client-id;
   clientSecretFile = /run/secrets/paperless-oidc-client-secret;
   redirectUris = [
     "https://paperless.example.com/accounts/oidc/authentik/login/callback/"
   ];
 };
 ```
+
+Set exactly one of:
+- `clientId` for a static client ID declared in Nix
+- `clientIdFile` for a runtime-provided client ID from a secret or generated file
 
 ### `services.authentik.blueprints.extraDirs`
 Additional directories whose `.yaml` files should be merged into the managed
