@@ -9,6 +9,7 @@ let
   cfg = config.services.authentik;
   generatedSecretsDir = "${cfg.stateDir}/secrets";
   managedBlueprintsDir = "${cfg.stateDir}/blueprints";
+  renderedBlueprintsDir = "${cfg.stateDir}/blueprints-rendered";
   usesManagedSecretKey = cfg.secretKeyFile == null;
   usesManagedBootstrapPassword = cfg.bootstrap.enable && cfg.bootstrap.passwordFile == null;
   needsNetworkOnline = !(cfg.database.createLocally && cfg.redis.createLocally);
@@ -292,10 +293,78 @@ in
           This can be used for runtime-rendered blueprints that include secrets.
         '';
       };
+
+      rendered = lib.mkOption {
+        type = lib.types.attrsOf (
+          lib.types.submodule (
+            { name, ... }:
+            {
+              options = {
+                fileName = lib.mkOption {
+                  type = lib.types.str;
+                  default = "${name}.yaml";
+                  description = "Filename to write under the rendered blueprints directory.";
+                };
+
+                script = lib.mkOption {
+                  type = lib.types.lines;
+                  description = ''
+                    Shell script fragment that writes the rendered blueprint to
+                    `$AUTHENTIK_BLUEPRINT_OUTPUT`.
+                  '';
+                };
+              };
+            }
+          )
+        );
+        default = { };
+        example = {
+          paperless = {
+            fileName = "paperless-ngx.yaml";
+            script = ''
+              cat > "$AUTHENTIK_BLUEPRINT_OUTPUT" <<'EOF'
+              version: 1
+              metadata:
+                name: Paperless NGX
+              entries: []
+              EOF
+            '';
+          };
+        };
+        description = ''
+          Runtime-rendered blueprint files that should be generated before
+          Authentik prepares its managed blueprint directory.
+        '';
+      };
     };
   };
 
-  config = lib.mkIf cfg.enable {
+  config =
+    let
+      hasRenderedBlueprints = cfg.blueprints.rendered != { };
+      effectiveBlueprintExtraDirs =
+        lib.optionals hasRenderedBlueprints [ renderedBlueprintsDir ] ++ cfg.blueprints.extraDirs;
+      renderBlueprintsScript = pkgs.writeShellScript "authentik-render-blueprints" ''
+        set -euo pipefail
+
+        install -d -m 0755 ${lib.escapeShellArg renderedBlueprintsDir}
+        ${pkgs.findutils}/bin/find ${lib.escapeShellArg renderedBlueprintsDir} -mindepth 1 -delete
+
+        ${lib.concatMapStringsSep "\n" (
+          name:
+          let
+            renderedCfg = cfg.blueprints.rendered.${name};
+          in
+          ''
+            (
+              export AUTHENTIK_BLUEPRINT_OUTPUT=${lib.escapeShellArg "${renderedBlueprintsDir}/${renderedCfg.fileName}"}
+              ${renderedCfg.script}
+            )
+          ''
+        ) (builtins.attrNames cfg.blueprints.rendered)}
+      '';
+    in
+    lib.mkIf cfg.enable {
     assertions = [
       {
         assertion = cfg.database.createLocally || cfg.database.host != "";
@@ -348,6 +417,8 @@ in
       "d ${cfg.mediaDir} 0750 ${cfg.user} ${cfg.group} -"
       "d ${generatedSecretsDir} 0750 ${cfg.user} ${cfg.group} -"
       "d ${managedBlueprintsDir} 0755 ${cfg.user} ${cfg.group} -"
+    ] ++ lib.optionals hasRenderedBlueprints [
+      "d ${renderedBlueprintsDir} 0755 root root -"
     ];
 
     systemd.services.authentik-prepare-secrets = {
@@ -410,6 +481,8 @@ in
       ] ++ lib.optionals cfg.worker.enable [
         "authentik-worker.service"
       ];
+      after = lib.optionals hasRenderedBlueprints [ "authentik-render-blueprints.service" ];
+      requires = lib.optionals hasRenderedBlueprints [ "authentik-render-blueprints.service" ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
         Type = "oneshot";
@@ -447,10 +520,24 @@ in
                 echo "Warning: configured blueprint directory is missing: ${dir}" >&2
               fi
             ''
-          ) cfg.blueprints.extraDirs}
+          ) effectiveBlueprintExtraDirs}
 
           chown -R ${lib.escapeShellArg cfg.user}:${lib.escapeShellArg cfg.group} ${lib.escapeShellArg managedBlueprintsDir}
         '';
+        ReadWritePaths = [ cfg.stateDir ];
+      };
+    };
+
+    systemd.services.authentik-render-blueprints = lib.mkIf hasRenderedBlueprints {
+      description = "Render Authentik runtime blueprints";
+      before = [ "authentik-prepare-blueprints.service" ];
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        User = "root";
+        Group = "root";
+        ExecStart = renderBlueprintsScript;
         ReadWritePaths = [ cfg.stateDir ];
       };
     };
@@ -562,5 +649,5 @@ in
         ];
       };
     };
-  };
+    };
 }
