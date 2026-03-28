@@ -8,9 +8,22 @@
 let
   cfg = config.services.authentik;
   generatedSecretsDir = "${cfg.stateDir}/secrets";
+  managedBlueprintsDir = "${cfg.stateDir}/blueprints";
   usesManagedSecretKey = cfg.secretKeyFile == null;
   usesManagedBootstrapPassword = cfg.bootstrap.enable && cfg.bootstrap.passwordFile == null;
   needsNetworkOnline = !(cfg.database.createLocally && cfg.redis.createLocally);
+  managedBlueprintFiles = lib.mapAttrsToList (
+    name: value:
+    pkgs.writeText name (
+      if builtins.isPath value then builtins.readFile value else value
+    )
+  ) cfg.blueprints.files;
+  storedBlueprintsDir = pkgs.linkFarm "authentik-extra-blueprints" (
+    map (file: {
+      name = builtins.baseNameOf file;
+      path = file;
+    }) managedBlueprintFiles
+  );
   effectiveSecretKeyFile =
     if cfg.secretKeyFile != null then cfg.secretKeyFile else "${generatedSecretsDir}/secret-key";
   effectiveBootstrapPasswordFile =
@@ -24,6 +37,32 @@ let
       boolString value
     else
       toString value;
+
+  packagedBlueprintsDir = pkgs.runCommand "authentik-packaged-blueprints-dir" {
+    nativeBuildInputs = [ pkgs.gnused ];
+  } ''
+    set -eu
+
+    env_path="$(${pkgs.gnused}/bin/sed -n 's@.*\(/nix/store/[^[:space:]]*-python[^[:space:]]*-env\)/bin.*@\1@p' ${cfg.package}/bin/ak | head -n 1)"
+    if [ -z "$env_path" ]; then
+      echo "Failed to determine Authentik Python environment from ${cfg.package}/bin/ak" >&2
+      exit 1
+    fi
+
+    default_yml="$(${pkgs.findutils}/bin/find "$env_path/lib" -path '*/authentik/lib/default.yml' | head -n 1)"
+    if [ -z "$default_yml" ]; then
+      echo "Failed to locate authentik/lib/default.yml under $env_path" >&2
+      exit 1
+    fi
+
+    blueprint_dir="$(${pkgs.gnused}/bin/sed -n 's@^blueprints_dir: @@p' "$default_yml" | head -n 1)"
+    if [ -z "$blueprint_dir" ]; then
+      echo "Failed to determine packaged blueprints_dir from $default_yml" >&2
+      exit 1
+    fi
+
+    printf '%s' "$blueprint_dir" > "$out"
+  '';
 
   renderExports =
     attrs:
@@ -224,6 +263,42 @@ in
         description = "Whether to run the Authentik worker service.";
       };
     };
+
+    blueprints = {
+      files = lib.mkOption {
+        type = lib.types.attrsOf (
+          lib.types.oneOf [
+            lib.types.lines
+            lib.types.path
+          ]
+        );
+        default = { };
+        example = {
+          "paperless.yaml" = ''
+            version: 1
+            metadata:
+              name: Paperless
+            entries: []
+          '';
+        };
+        description = ''
+          Additional Authentik blueprint YAML files to merge into the managed
+          blueprint directory.
+        '';
+      };
+
+      extraDirs = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "/var/lib/authentik/blueprints-local" ];
+        description = ''
+          Additional directories whose `.yaml` blueprint files should be merged
+          into the managed blueprint directory before Authentik starts.
+
+          This can be used for runtime-rendered blueprints that include secrets.
+        '';
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -250,6 +325,10 @@ in
     };
 
     users.groups.${cfg.group} = { };
+
+    environment.etc."authentik/config.yml".text = ''
+      blueprints_dir: ${managedBlueprintsDir}
+    '';
 
     services.postgresql = lib.mkIf cfg.database.createLocally {
       enable = true;
@@ -328,6 +407,44 @@ in
       };
     };
 
+    systemd.services.authentik-prepare-blueprints = {
+      description = "Prepare Authentik blueprints directory";
+      before = [
+        "authentik-migrate.service"
+        "authentik-server.service"
+      ] ++ lib.optionals cfg.worker.enable [
+        "authentik-worker.service"
+      ];
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        User = "root";
+        Group = "root";
+        ExecStart = pkgs.writeShellScript "authentik-prepare-blueprints" ''
+          set -eu
+
+          install -d -m 0755 ${lib.escapeShellArg managedBlueprintsDir}
+          rm -rf ${lib.escapeShellArg managedBlueprintsDir}/*
+
+          packaged_blueprints_dir="$(cat ${packagedBlueprintsDir})"
+          cp -a --no-preserve=ownership "$packaged_blueprints_dir"/. ${lib.escapeShellArg managedBlueprintsDir}/
+
+          ${lib.optionalString (managedBlueprintFiles != [ ]) ''
+            cp -a --no-preserve=ownership ${storedBlueprintsDir}/. ${lib.escapeShellArg managedBlueprintsDir}/
+          ''}
+
+          ${lib.concatMapStringsSep "\n" (
+            dir: ''
+              if [ -d ${lib.escapeShellArg dir} ]; then
+                cp -a --no-preserve=ownership ${lib.escapeShellArg dir}/. ${lib.escapeShellArg managedBlueprintsDir}/
+              fi
+            ''
+          ) cfg.blueprints.extraDirs}
+        '';
+        ReadWritePaths = [ managedBlueprintsDir ];
+      };
+    };
+
     systemd.services.authentik-migrate = {
       description = "Auth­entik database migrations";
       before = [
@@ -336,12 +453,12 @@ in
         "authentik-worker.service"
       ];
       after =
-        [ "authentik-prepare-secrets.service" ]
+        [ "authentik-prepare-blueprints.service" "authentik-prepare-secrets.service" ]
         ++ lib.optionals needsNetworkOnline [ "network-online.target" ]
         ++ lib.optionals (!needsNetworkOnline) [ "network.target" ]
         ++ lib.optionals cfg.database.createLocally [ "postgresql.service" ]
         ++ lib.optionals cfg.redis.createLocally [ "redis-authentik.service" ];
-      requires = [ "authentik-prepare-secrets.service" ];
+      requires = [ "authentik-prepare-blueprints.service" "authentik-prepare-secrets.service" ];
       wants =
         lib.optionals needsNetworkOnline [ "network-online.target" ]
         ++
@@ -370,6 +487,7 @@ in
       description = "Auth­entik server";
       wantedBy = [ "multi-user.target" ];
       after = [
+        "authentik-prepare-blueprints.service"
         "authentik-prepare-secrets.service"
         "authentik-migrate.service"
       ] ++ lib.optionals needsNetworkOnline [ "network-online.target" ]
@@ -377,6 +495,7 @@ in
         ++ lib.optionals cfg.database.createLocally [ "postgresql.service" ]
         ++ lib.optionals cfg.redis.createLocally [ "redis-authentik.service" ];
       requires = [
+        "authentik-prepare-blueprints.service"
         "authentik-prepare-secrets.service"
         "authentik-migrate.service"
       ];
@@ -405,11 +524,13 @@ in
       description = "Auth­entik worker";
       wantedBy = [ "multi-user.target" ];
       after = [
+        "authentik-prepare-blueprints.service"
         "authentik-prepare-secrets.service"
         "authentik-migrate.service"
         "authentik-server.service"
       ];
       requires = [
+        "authentik-prepare-blueprints.service"
         "authentik-prepare-secrets.service"
         "authentik-migrate.service"
       ];
