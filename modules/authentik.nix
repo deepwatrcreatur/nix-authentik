@@ -347,6 +347,7 @@ in
       "d ${cfg.stateDir} 0750 ${cfg.user} ${cfg.group} -"
       "d ${cfg.mediaDir} 0750 ${cfg.user} ${cfg.group} -"
       "d ${generatedSecretsDir} 0750 ${cfg.user} ${cfg.group} -"
+      "d ${managedBlueprintsDir} 0755 ${cfg.user} ${cfg.group} -"
     ];
 
     systemd.services.authentik-prepare-secrets = {
@@ -450,7 +451,7 @@ in
 
           chown -R ${lib.escapeShellArg cfg.user}:${lib.escapeShellArg cfg.group} ${lib.escapeShellArg managedBlueprintsDir}
         '';
-        ReadWritePaths = [ managedBlueprintsDir ];
+        ReadWritePaths = [ cfg.stateDir ];
       };
     };
 
