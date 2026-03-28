@@ -8,6 +8,9 @@
 let
   cfg = config.services.authentik;
   generatedSecretsDir = "${cfg.stateDir}/secrets";
+  usesManagedSecretKey = cfg.secretKeyFile == null;
+  usesManagedBootstrapPassword = cfg.bootstrap.enable && cfg.bootstrap.passwordFile == null;
+  needsNetworkOnline = !(cfg.database.createLocally && cfg.redis.createLocally);
   effectiveSecretKeyFile =
     if cfg.secretKeyFile != null then cfg.secretKeyFile else "${generatedSecretsDir}/secret-key";
   effectiveBootstrapPasswordFile =
@@ -290,15 +293,31 @@ in
 
           install -d -m 0750 ${lib.escapeShellArg generatedSecretsDir}
 
-          if [ ! -s ${lib.escapeShellArg effectiveSecretKeyFile} ]; then
-            umask 0077
-            ${pkgs.openssl}/bin/openssl rand -hex 64 > ${lib.escapeShellArg effectiveSecretKeyFile}
-          fi
+          ${lib.optionalString usesManagedSecretKey ''
+            if [ ! -s ${lib.escapeShellArg effectiveSecretKeyFile} ]; then
+              umask 0077
+              ${pkgs.openssl}/bin/openssl rand -hex 64 > ${lib.escapeShellArg effectiveSecretKeyFile}
+            fi
+          ''}
 
-          ${lib.optionalString cfg.bootstrap.enable ''
+          ${lib.optionalString (!usesManagedSecretKey) ''
+            if [ ! -s ${lib.escapeShellArg effectiveSecretKeyFile} ]; then
+              echo "Configured services.authentik.secretKeyFile is missing or empty: ${effectiveSecretKeyFile}" >&2
+              exit 1
+            fi
+          ''}
+
+          ${lib.optionalString usesManagedBootstrapPassword ''
             if [ ! -s ${lib.escapeShellArg effectiveBootstrapPasswordFile} ]; then
               umask 0077
               ${pkgs.openssl}/bin/openssl rand -base64 24 > ${lib.escapeShellArg effectiveBootstrapPasswordFile}
+            fi
+          ''}
+
+          ${lib.optionalString (cfg.bootstrap.enable && !usesManagedBootstrapPassword) ''
+            if [ ! -s ${lib.escapeShellArg effectiveBootstrapPasswordFile} ]; then
+              echo "Configured services.authentik.bootstrap.passwordFile is missing or empty: ${effectiveBootstrapPasswordFile}" >&2
+              exit 1
             fi
           ''}
         '';
@@ -317,14 +336,14 @@ in
         "authentik-worker.service"
       ];
       after =
-        [
-          "network.target"
-          "authentik-prepare-secrets.service"
-        ]
+        [ "authentik-prepare-secrets.service" ]
+        ++ lib.optionals needsNetworkOnline [ "network-online.target" ]
+        ++ lib.optionals (!needsNetworkOnline) [ "network.target" ]
         ++ lib.optionals cfg.database.createLocally [ "postgresql.service" ]
         ++ lib.optionals cfg.redis.createLocally [ "redis-authentik.service" ];
+      requires = [ "authentik-prepare-secrets.service" ];
       wants =
-        [ "authentik-prepare-secrets.service" ]
+        lib.optionals needsNetworkOnline [ "network-online.target" ]
         ++
         lib.optionals cfg.database.createLocally [ "postgresql.service" ]
         ++ lib.optionals cfg.redis.createLocally [ "redis-authentik.service" ];
@@ -351,15 +370,18 @@ in
       description = "Auth­entik server";
       wantedBy = [ "multi-user.target" ];
       after = [
-        "network.target"
         "authentik-prepare-secrets.service"
         "authentik-migrate.service"
-      ] ++ lib.optionals cfg.database.createLocally [ "postgresql.service" ]
+      ] ++ lib.optionals needsNetworkOnline [ "network-online.target" ]
+        ++ lib.optionals (!needsNetworkOnline) [ "network.target" ]
+        ++ lib.optionals cfg.database.createLocally [ "postgresql.service" ]
         ++ lib.optionals cfg.redis.createLocally [ "redis-authentik.service" ];
-      wants = [
+      requires = [
         "authentik-prepare-secrets.service"
         "authentik-migrate.service"
-      ] ++ lib.optionals cfg.database.createLocally [ "postgresql.service" ]
+      ];
+      wants = lib.optionals needsNetworkOnline [ "network-online.target" ]
+        ++ lib.optionals cfg.database.createLocally [ "postgresql.service" ]
         ++ lib.optionals cfg.redis.createLocally [ "redis-authentik.service" ];
       serviceConfig = {
         User = cfg.user;
@@ -387,11 +409,11 @@ in
         "authentik-migrate.service"
         "authentik-server.service"
       ];
-      wants = [
+      requires = [
         "authentik-prepare-secrets.service"
         "authentik-migrate.service"
-        "authentik-server.service"
       ];
+      wants = [ "authentik-server.service" ];
       serviceConfig = {
         User = cfg.user;
         Group = cfg.group;
