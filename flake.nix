@@ -55,8 +55,6 @@
 
             services.authentik = {
               enable = true;
-              secretKeyFile = builtins.toFile "authentik-secret-key" "example-secret-key-change-me\n";
-              bootstrapPasswordFile = builtins.toFile "authentik-bootstrap-password" "change-me\n";
               domain = "auth.example.test";
             };
           }
