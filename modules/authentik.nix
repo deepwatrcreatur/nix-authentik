@@ -539,8 +539,9 @@ in
         lib.optionals hasRenderedBlueprints [ renderedBlueprintsDir ] ++ cfg.blueprints.extraDirs;
       renderBlueprintsScript = pkgs.writeShellScript "authentik-render-blueprints" ''
         set -euo pipefail
+        umask 0077
 
-        install -d -m 0755 ${lib.escapeShellArg renderedBlueprintsDir}
+        install -d -m 0750 ${lib.escapeShellArg renderedBlueprintsDir}
         ${pkgs.findutils}/bin/find ${lib.escapeShellArg renderedBlueprintsDir} -mindepth 1 -delete
 
         ${lib.concatMapStringsSep "\n" (
@@ -632,9 +633,9 @@ in
       "d ${cfg.stateDir} 0750 ${cfg.user} ${cfg.group} -"
       "d ${cfg.mediaDir} 0750 ${cfg.user} ${cfg.group} -"
       "d ${generatedSecretsDir} 0750 ${cfg.user} ${cfg.group} -"
-      "d ${managedBlueprintsDir} 0755 ${cfg.user} ${cfg.group} -"
+      "d ${managedBlueprintsDir} 0750 ${cfg.user} ${cfg.group} -"
     ] ++ lib.optionals hasRenderedBlueprints [
-      "d ${renderedBlueprintsDir} 0755 root root -"
+      "d ${renderedBlueprintsDir} 0750 root root -"
     ];
 
     systemd.services.authentik-prepare-secrets = {
@@ -718,7 +719,7 @@ in
             exit 1
           fi
 
-          install -d -m 0755 ${lib.escapeShellArg managedBlueprintsDir}
+          install -d -m 0750 ${lib.escapeShellArg managedBlueprintsDir}
           ${pkgs.findutils}/bin/find ${lib.escapeShellArg managedBlueprintsDir} -mindepth 1 -delete
 
           packaged_blueprints_dir="$(cat ${packagedBlueprintsDir})"
@@ -739,6 +740,7 @@ in
           ) effectiveBlueprintExtraDirs}
 
           chown -R ${lib.escapeShellArg cfg.user}:${lib.escapeShellArg cfg.group} ${lib.escapeShellArg managedBlueprintsDir}
+          chmod -R u=rwX,g=rX,o= ${lib.escapeShellArg managedBlueprintsDir}
         '';
         ReadWritePaths = [ cfg.stateDir ];
       };

@@ -210,6 +210,10 @@ Each OIDC application entry:
 This keeps the application structure in the flake instead of pushing raw
 Auth­entik blueprint YAML into each consuming repo.
 
+The managed and rendered blueprint directories are created with restrictive
+permissions so rendered OIDC client secrets do not end up world-readable on
+disk.
+
 ## Development Direction
 
 Likely next steps:
