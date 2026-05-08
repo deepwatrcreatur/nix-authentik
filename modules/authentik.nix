@@ -19,14 +19,12 @@ let
   usesManagedSecretKey = cfg.secretKeyFile == null;
   usesManagedBootstrapPassword = cfg.bootstrap.enable && cfg.bootstrap.passwordFile == null;
   needsNetworkOnline = !(cfg.database.createLocally && cfg.redis.createLocally);
-  storedBlueprintsDir = pkgs.linkFarm "authentik-extra-blueprints" (
+  storedBlueprintsDir = pkgs.linkFarmFromDrvs "authentik-extra-blueprints" (
     lib.mapAttrsToList (
-      name: value: {
-        inherit name;
-        path = pkgs.writeText name (
-          if builtins.isPath value then builtins.readFile value else value
-        );
-      }
+      name: value:
+      pkgs.writeText name (
+        if builtins.isPath value then builtins.readFile value else value
+      )
     ) cfg.blueprints.files
   );
   effectiveSecretKeyFile =
